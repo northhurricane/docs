@@ -1,0 +1,722 @@
+Index: mysys/mf_iocache2.c
+===================================================================
+--- mysys/mf_iocache2.c	(revision 1)
++++ mysys/mf_iocache2.c	(working copy)
+@@ -66,7 +66,45 @@
+   DBUG_RETURN(0);
+ }
+ 
++/* Flashback BY P.Linux */
++char *my_b_copy_to_string(IO_CACHE *cache, size_t *bytes_in_cache)
++{
++  char *buff;
++  char *tmp_buff;
++  size_t now_size;
++  size_t inc_size;
+ 
++  /* Reinit the cache to read from the beginning of the cache */
++  if (reinit_io_cache(cache, READ_CACHE, 0L, FALSE, FALSE))
++    return NULL;
++
++  now_size= my_b_bytes_in_cache(cache);
++  inc_size= 0;
++  buff= (char *) my_malloc(now_size + 1, MYF(0));
++  tmp_buff= buff;
++  do
++  {
++    now_size+= inc_size;
++    if(inc_size > 0)
++    {
++      buff= (char *) my_realloc(buff, now_size + 1, MYF(0));
++      tmp_buff= buff + (now_size - inc_size);
++      memcpy(tmp_buff, cache->read_pos, inc_size);
++    }
++    else
++    {
++      memcpy(tmp_buff, cache->read_pos, now_size);
++    }
++    cache->read_pos= cache->read_end;
++  } while ((inc_size= my_b_fill(cache)));
++  buff[now_size]= '\0';
++
++  reinit_io_cache(cache, WRITE_CACHE, 0, FALSE, TRUE);
++  *bytes_in_cache= now_size;
++  return buff;
++}
++/* End */
++
+ my_off_t my_b_append_tell(IO_CACHE* info)
+ {
+   /*
+Index: include/my_sys.h
+===================================================================
+--- include/my_sys.h	(revision 1)
++++ include/my_sys.h	(working copy)
+@@ -534,6 +534,7 @@
+ 
+ /* tell write offset in the SEQ_APPEND cache */
+ int      my_b_copy_to_file(IO_CACHE *cache, FILE *file);
++char*    my_b_copy_to_string(IO_CACHE *cache, size_t *bytes_in_cache); // Flashback BY P.Linux
+ my_off_t my_b_append_tell(IO_CACHE* info);
+ my_off_t my_b_safe_tell(IO_CACHE* info); /* picks the correct tell() */
+ 
+Index: sql/log_event.h
+===================================================================
+--- sql/log_event.h	(revision 1)
++++ sql/log_event.h	(working copy)
+@@ -41,6 +41,10 @@
+ #include "hash.h"
+ #include "rpl_tblmap.h"
+ #include "rpl_tblmap.cc"
++/* Flashback BY P.Linux */
++#include "sql_string.h"
++#include "sql_string.cc"
++/* End */
+ #endif
+ 
+ #ifdef MYSQL_SERVER
+@@ -50,7 +54,9 @@
+ #endif
+ 
+ /* Forward declarations */
++#ifndef MYSQL_CLIENT
+ class String;
++#endif
+ 
+ #define PREFIX_SQL_LOAD "SQL_LOAD-"
+ 
+@@ -1030,7 +1036,19 @@
+   void print_base64(IO_CACHE* file, PRINT_EVENT_INFO* print_event_info,
+                     bool is_more);
+ #endif
++  /* Flashback BY P.Linux */
++  my_bool is_flashback;
++  String output_buf;
+ 
++  void free_output_buffer()
++  {
++    if (!output_buf.is_empty())
++    {
++      output_buf.free();
++    }
++  }
++  /* End */
++
+   static void *operator new(size_t size)
+   {
+     return (void*) my_malloc((uint)size, MYF(MY_WME|MY_FAE));
+@@ -1089,7 +1107,15 @@
+   }
+   Log_event(const char* buf, const Format_description_log_event
+             *description_event);
+-  virtual ~Log_event() { free_temp_buf();}
++  virtual ~Log_event() 
++  { 
++    free_temp_buf(); 
++    /* Flashback BY P.Linux */
++#ifdef MYSQL_CLIENT 
++    free_output_buffer(); 
++#endif
++    /* End */
++  } 
+   void register_temp_buf(char* buf) { temp_buf = buf; }
+   void free_temp_buf()
+   {
+@@ -3572,12 +3598,14 @@
+ #ifdef MYSQL_CLIENT
+   /* not for direct call, each derived has its own ::print() */
+   virtual void print(FILE *file, PRINT_EVENT_INFO *print_event_info)= 0;
++  void exchange_update_rows(PRINT_EVENT_INFO *print_event_info, uchar *rows_buff); // Flashback BY P.Linux
+   void print_verbose(IO_CACHE *file,
+                      PRINT_EVENT_INFO *print_event_info);
+   size_t print_verbose_one_row(IO_CACHE *file, table_def *td,
+                                PRINT_EVENT_INFO *print_event_info,
+                                MY_BITMAP *cols_bitmap,
+-                               const uchar *ptr, const uchar *prefix);
++                               const uchar *ptr, const uchar *prefix,
++                               const my_bool only_parse= 0); // Flashback BY P.Linux
+ #endif
+ 
+ #ifdef MYSQL_SERVER
+@@ -3658,6 +3686,8 @@
+   uchar    *m_rows_cur;		/* One-after the end of the data */
+   uchar    *m_rows_end;		/* One-after the end of the allocated space */
+ 
++  size_t   m_rows_before_size;  /* The length before m_rows_buf BY P.Linux */
++
+   flag_set m_flags;		/* Flags for row-level events */
+ 
+   /* helper functions */
+@@ -4041,6 +4071,13 @@
+   LEX_STRING m_message;
+ };
+ 
++/* Flashback BY P.Linux */ 
++static inline char *copy_event_cache_to_string_and_reinit(IO_CACHE *cache, size_t *bytes_in_cache)
++{
++  return my_b_copy_to_string(cache, bytes_in_cache);
++}
++/* End */
++
+ static inline bool copy_event_cache_to_file_and_reinit(IO_CACHE *cache,
+                                                        FILE *file)
+ {
+Index: sql/log_event.cc
+===================================================================
+--- sql/log_event.cc	(revision 1)
++++ sql/log_event.cc	(working copy)
+@@ -218,18 +218,30 @@
+       constructor, but it would be possible to create a subclass
+       holding the IO_CACHE itself.
+    */
+-  Write_on_release_cache(IO_CACHE *cache, FILE *file, flag_set flags = 0)
+-    : m_cache(cache), m_file(file), m_flags(flags)
++  Write_on_release_cache(IO_CACHE *cache, FILE *file, flag_set flags = 0, Log_event *ev = NULL)
++    : m_cache(cache), m_file(file), m_flags(flags), m_ev(ev) // Flashback BY P.Linux
+   {
+     reinit_io_cache(m_cache, WRITE_CACHE, 0L, FALSE, TRUE);
+   }
+ 
+   ~Write_on_release_cache()
+   {
++    if(m_ev == NULL)
++    {
+     copy_event_cache_to_file_and_reinit(m_cache, m_file);
+     if (m_flags | FLUSH_F)
+       fflush(m_file);
+   }
++    /* Flashback BY P.Linux */
++    else
++    {
++      size_t bytes_in_cache= 0;
++      char *buff= 0;
++      buff= copy_event_cache_to_string_and_reinit(m_cache, &bytes_in_cache);
++      m_ev->output_buf.append(buff, bytes_in_cache);
++    }
++    /* End */
++  }
+ 
+   /*
+     Return a pointer to the internal IO_CACHE.
+@@ -258,6 +270,7 @@
+   IO_CACHE *m_cache;
+   FILE *m_file;
+   flag_set m_flags;
++  Log_event *m_ev; // Flashback BY P.Linux
+ };
+ 
+ #ifndef DBUG_OFF
+@@ -1860,7 +1873,184 @@
+   return 0;
+ }
+ 
++/* Flashback By P.Linux */
++static size_t
++log_event_print_value(const uchar *ptr,
++                      uint type, uint meta,
++                      char *typestr, size_t typestr_length)
++{
++  uint32 length= 0;
+ 
++  if (type == MYSQL_TYPE_STRING)
++  {
++    if (meta >= 256)
++    {
++      uint byte0= meta >> 8;
++      uint byte1= meta & 0xFF;
++      
++      if ((byte0 & 0x30) != 0x30)
++      {
++        /* a long CHAR() field: see #37426 */
++        length= byte1 | (((byte0 & 0x30) ^ 0x30) << 4);
++        type= byte0 | 0x30;
++      }
++      else
++        length = meta & 0xFF;
++    }
++    else
++      length= meta;
++  }
++
++  switch (type) {
++  case MYSQL_TYPE_LONG:
++    {
++      return 4;
++    }
++
++  case MYSQL_TYPE_TINY:
++    {
++      return 1;
++    }
++
++  case MYSQL_TYPE_SHORT:
++    {
++      return 2;
++    }
++  
++  case MYSQL_TYPE_INT24:
++    {
++      return 3;
++    }
++
++  case MYSQL_TYPE_LONGLONG:
++    {
++      return 8;
++    }
++
++  case MYSQL_TYPE_NEWDECIMAL:
++    {
++      uint precision= meta >> 8;
++      uint decimals= meta & 0xFF;
++      uint bin_size= my_decimal_get_binary_size(precision, decimals);
++      return bin_size;
++    }
++
++  case MYSQL_TYPE_FLOAT:
++    {
++      return 4;
++    }
++
++  case MYSQL_TYPE_DOUBLE:
++    {
++      return 8;
++    }
++  
++  case MYSQL_TYPE_BIT:
++    {
++      /* Meta-data: bit_len, bytes_in_rec, 2 bytes */
++      uint nbits= ((meta >> 8) * 8) + (meta & 0xFF);
++      length= (nbits + 7) / 8;
++      return length;
++    }
++
++  case MYSQL_TYPE_TIMESTAMP:
++    {
++      return 4;
++    }
++
++  case MYSQL_TYPE_DATETIME:
++    {
++      return 8;
++    }
++
++  case MYSQL_TYPE_TIME:
++    {
++      return 3;
++    }
++    
++  case MYSQL_TYPE_NEWDATE:
++    {
++      return 3;
++    }
++    
++  case MYSQL_TYPE_DATE:
++    {
++      return 3;
++    }
++  
++  case MYSQL_TYPE_YEAR:
++    {
++      return 1;
++    }
++  
++  case MYSQL_TYPE_ENUM:
++    switch (meta & 0xFF) {
++    case 1:
++      return 1;
++    case 2:
++      {
++        return 2;
++      }
++    default:
++      return 0;
++    }
++    break;
++    
++  case MYSQL_TYPE_SET:
++    return meta & 0xFF;
++  
++  case MYSQL_TYPE_BLOB:
++    switch (meta) {
++    case 1:
++      length= *ptr;
++      return length + 1;
++    case 2:
++      length= uint2korr(ptr);
++      return length + 2;
++    case 3:
++      length= uint3korr(ptr);
++      return length + 3;
++    case 4:
++      length= uint4korr(ptr);
++      return length + 4;
++    default:
++      return 0;
++    }
++
++  case MYSQL_TYPE_VARCHAR:
++  case MYSQL_TYPE_VAR_STRING:
++    length= meta;
++    if (length < 256)
++    {
++      length= *ptr;
++      return length + 1;
++    }
++    else
++    {
++      length= uint2korr(ptr);
++      return length + 2;
++    }
++
++  case MYSQL_TYPE_STRING:
++    if (length < 256)
++    {
++      length= *ptr;
++      return length + 1;
++    }
++    else
++    {
++      length= uint2korr(ptr);
++      return length + 2;
++    }
++
++    break;
++  }
++  *typestr= 0;
++  return 0;
++}
++
++/* End */
++
+ /**
+   Print a packed row into IO cache
+   
+@@ -1879,7 +2069,8 @@
+ Rows_log_event::print_verbose_one_row(IO_CACHE *file, table_def *td,
+                                       PRINT_EVENT_INFO *print_event_info,
+                                       MY_BITMAP *cols_bitmap,
+-                                      const uchar *value, const uchar *prefix)
++                                      const uchar *value, const uchar *prefix,
++                                      const my_bool only_parse) // Flashback BY P.Linux
+ {
+   const uchar *value0= value;
+   const uchar *null_bits= value;
+@@ -1888,6 +2079,7 @@
+   
+   value+= (m_width + 7) / 8;
+   
++  if (!only_parse) // Flashback BY P.Linux
+   my_b_printf(file, "%s", prefix);
+   
+   for (size_t i= 0; i < td->size(); i ++)
+@@ -1900,14 +2092,27 @@
+     
+     if (is_null)
+     {
++      if (!only_parse) // Flashback BY P.Linux
+       my_b_printf(file, "###   @%d=NULL", i + 1);
+     }
+     else
+     {
++      size_t size= 0; // Flashback BY P.Linux
++      if (!only_parse) 
++      {
+       my_b_printf(file, "###   @%d=", i + 1);
+-      size_t size= log_event_print_value(file, value,
++        size= log_event_print_value(file, value,
++                                    td->type(i), td->field_metadata(i),
++                                    typestr, sizeof(typestr));
++      }
++      /* Flashback BY P.Linux */
++      else
++      {
++        size= log_event_print_value(value,
+                                          td->type(i), td->field_metadata(i),
+                                          typestr, sizeof(typestr));
++      }
++      /* End */
+       if (!size)
+         return 0;
+ 
+@@ -1916,8 +2121,11 @@
+ 
+     if (print_event_info->verbose > 1)
+     {
++      if (!only_parse) // Flashback BY P.Linux
+       my_b_printf(file, " /* ");
+ 
++      if (!only_parse) // Flashback BY P.Linux
++      {
+       if (typestr[0])
+         my_b_printf(file, "%s ", typestr);
+       else
+@@ -1928,7 +2136,9 @@
+                   td->maybe_null(i), is_null);
+       my_b_printf(file, "*/");
+     }
++    }
+     
++    if (!only_parse) // Flashback BY P.Linux
+     my_b_printf(file, "\n");
+     
+     null_bit_index++;
+@@ -1936,7 +2146,57 @@
+   return value - value0;
+ }
+ 
++/* Flashback BY P.Linux */
++void Rows_log_event::exchange_update_rows(PRINT_EVENT_INFO *print_event_info,
++                                          uchar *rows_buff)
++{
++  Table_map_log_event *map;
++  table_def *td;
++  uchar *data_buff= rows_buff + m_rows_before_size;
+ 
++  if (!(map= print_event_info->m_table_map.get_table(m_table_id)) ||
++      !(td= map->create_table_def()))
++  {
++    return;
++  }
++
++  for (uchar *value= m_rows_buf; value < m_rows_end; )
++  {
++    uchar *start_pos= value;
++    size_t length1;
++    if (!(length1= print_verbose_one_row(NULL, td, print_event_info,
++                                         &m_cols, value,
++                                         (const uchar*) "", TRUE)))
++      return;
++    value+= length1;
++
++    size_t length2;
++    if (!(length2= print_verbose_one_row(NULL, td, print_event_info,
++                                        &m_cols, value,
++                                        (const uchar*) "", TRUE)))
++      return;
++    value+= length2;
++
++    /* Swap SET and WHERE part */
++    uchar *swap_buff1= (uchar *) my_malloc(length1, MYF(0));
++    uchar *swap_buff2= (uchar *) my_malloc(length2, MYF(0));
++
++    memcpy(swap_buff1, start_pos, length1); // SET part
++    memcpy(swap_buff2, start_pos + length1, length2); // WHERE part
++
++    memcpy(start_pos, swap_buff2, length2);
++    memcpy(start_pos + length2, swap_buff1, length1);
++
++    /* Free Swap Buffer */
++    my_free(swap_buff1);
++    my_free(swap_buff2);
++  }
++
++  /* Move to rows_buff */
++  memcpy(data_buff, m_rows_buf, m_rows_end - m_rows_buf);
++}
++/* End */
++
+ /**
+   Print a row event into IO cache in human readable form (in SQL format)
+   
+@@ -2018,7 +2278,7 @@
+                              PRINT_EVENT_INFO* print_event_info,
+                              bool more)
+ {
+-  const uchar *ptr= (const uchar *)temp_buf;
++  uchar *ptr= (uchar *)temp_buf;
+   uint32 size= uint4korr(ptr + EVENT_LEN_OFFSET);
+   DBUG_ENTER("Log_event::print_base64");
+ 
+@@ -2030,6 +2290,26 @@
+     DBUG_VOID_RETURN;
+   }
+ 
++  /* Flashback BY P.Linux */
++  if(is_flashback)
++  {
++    switch (ptr[4]) {
++      case WRITE_ROWS_EVENT:
++        ptr[4]= DELETE_ROWS_EVENT;
++        break;
++      case DELETE_ROWS_EVENT:
++        ptr[4]= WRITE_ROWS_EVENT;
++        break;
++      case UPDATE_ROWS_EVENT:
++        Rows_log_event *ev= NULL;
++        ev= new Update_rows_log_event((const char*) ptr, size,
++                                       glob_description_event);
++        ev->exchange_update_rows(print_event_info, ptr);
++        break;
++    }
++  }
++  /* End */
++
+   if (base64_encode(ptr, (size_t) size, tmp_str))
+   {
+     DBUG_ASSERT(0);
+@@ -3146,7 +3426,7 @@
+ 
+ void Query_log_event::print(FILE* file, PRINT_EVENT_INFO* print_event_info)
+ {
+-  Write_on_release_cache cache(&print_event_info->head_cache, file);
++  Write_on_release_cache cache(&print_event_info->head_cache, file, 0, this);
+ 
+   print_query_header(&cache, print_event_info);
+   my_b_write(&cache, (uchar*) query, q_len);
+@@ -5571,7 +5851,7 @@
+ void Xid_log_event::print(FILE* file, PRINT_EVENT_INFO* print_event_info)
+ {
+   Write_on_release_cache cache(&print_event_info->head_cache, file,
+-                               Write_on_release_cache::FLUSH_F);
++                               Write_on_release_cache::FLUSH_F, this); // Flashback BY P.Linux
+ 
+   if (!print_event_info->short_form)
+   {
+@@ -7451,6 +7731,7 @@
+     m_rows_end= m_rows_buf + data_size;
+     m_rows_cur= m_rows_end;
+     memcpy(m_rows_buf, ptr_rows_data, data_size);
++    m_rows_before_size= ptr_rows_data - (const uchar *) buf; // Flashback BY P.Linux
+   }
+   else
+     m_cols.bitmap= 0; // to not free it
+@@ -8109,8 +8390,16 @@
+ 
+   if (get_flags(STMT_END_F))
+   {
+-    copy_event_cache_to_file_and_reinit(head, file);
+-    copy_event_cache_to_file_and_reinit(body, file);
++    /* Flashback BY P.Linux */
++    size_t bytes_in_cache= 0;
++    char *buff= 0;
++
++    buff= copy_event_cache_to_string_and_reinit(head, &bytes_in_cache);
++    output_buf.append(buff, bytes_in_cache);
++
++    buff= copy_event_cache_to_string_and_reinit(body, &bytes_in_cache);
++    output_buf.append(buff, bytes_in_cache);
++    /* End */
+   }
+ }
+ #endif
+Index: client/mysqlbinlog.cc
+===================================================================
+--- client/mysqlbinlog.cc	(revision 1)
++++ client/mysqlbinlog.cc	(working copy)
+@@ -44,6 +44,11 @@
+ 
+ #define CLIENT_CAPABILITIES	(CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_LOCAL_FILES)
+ 
++
++/* Flashback BY P.Linux */
++DYNAMIC_ARRAY binlog_events;
++/* End */
++
+ char server_version[SERVER_VERSION_LENGTH];
+ ulong server_id = 0;
+ 
+@@ -103,6 +108,8 @@
+ static MYSQL* mysql = NULL;
+ static char* dirname_for_local_load= 0;
+ 
++static my_bool flashback_opt; // Flashback BY P.Linux
++
+ /**
+   Pointer to the Format_description_log_event of the currently active binlog.
+ 
+@@ -699,6 +706,8 @@
+   print_event_info->short_form= short_form;
+   Exit_status retval= OK_CONTINUE;
+ 
++
++  ev->is_flashback= flashback_opt; // Flashback BY P.Linux
+   /*
+     Format events are not concerned by --offset and such, we always need to
+     read them to be able to process the wanted events.
+@@ -736,8 +745,11 @@
+       goto end;
+     }
+     if (!short_form)
++    {
+       fprintf(result_file, "# at %s\n",llstr(pos,ll_buff));
+ 
++    }
++
+     if (!opt_hexdump)
+       print_event_info->hexdump_from= 0; /* Disabled */
+     else
+@@ -1003,6 +1015,17 @@
+   */
+   if (ev)
+   {
++    /* Flashback BY P.Linux */
++    if(!ev->output_buf.is_empty())
++    {
++      String *tmp_str= new String[1];
++      tmp_str->copy(ev->output_buf);
++      (void) push_dynamic(&binlog_events, (uchar *) tmp_str);
++      if (!flashback_opt)
++        printf("%s", ev->output_buf.ptr());
++      ev->free_output_buffer();
++    }
++    /* End */
+     if (remote_opt)
+       ev->temp_buf= 0;
+     if (destroy_evt) /* destroy it later if not set (ignored table map) */
+@@ -1098,6 +1121,11 @@
+   {"read-from-remote-server", 'R', "Read binary logs from a MySQL server.",
+    &remote_opt, &remote_opt, 0, GET_BOOL, NO_ARG, 0, 0, 0, 0,
+    0, 0},
++  /* Flashback BY P.Linux */
++  {"flashback", 'B', "Flashback data to start_postition or start_datetime.",
++   &flashback_opt, &flashback_opt, 0, GET_BOOL, NO_ARG, 0, 0, 0, 0,
++   0, 0},
++  /* End */
+   {"result-file", 'r', "Direct output to a given file.", 0, 0, 0, GET_STR,
+    REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+   {"server-id", OPT_SERVER_ID,
+@@ -1330,6 +1358,11 @@
+   case 'R':
+     remote_opt= 1;
+     break;
++  /* Flashback BY P.Linux */
++  case 'B':
++    flashback_opt= 1;
++    break;
++  /* End */
+   case OPT_MYSQL_PROTOCOL:
+     opt_protocol= find_type_or_exit(argument, &sql_protocol_typelib,
+                                     opt->name);
+@@ -2034,6 +2067,10 @@
+   DBUG_ENTER("main");
+   DBUG_PROCESS(argv[0]);
+ 
++  /* Flashback BY P.Linux*/
++  (void) my_init_dynamic_array(&binlog_events, sizeof(String), 1024, 1024); 
++  /* End */
++
+   my_init_time(); // for time functions
+ 
+   if (load_defaults("my", load_default_groups, &argc, &argv))
+@@ -2111,6 +2148,21 @@
+     start_position= BIN_LOG_HEADER_SIZE;
+   }
+ 
++  /* Flashback BY P.Linux */
++  if(flashback_opt)
++  {
++    uint i= 0;
++    for (i=  binlog_events.elements - 1; i > 0; --i)
++    {
++      String *event_str= dynamic_element(&binlog_events, i, String*); 
++      printf("%s", event_str->ptr());
++    }
++    delete_dynamic(&binlog_events);
++    /* Set delimiter back to semicolon */
++    fprintf(result_file, "DELIMITER ;\n");
++  }
++  /* End */
++
+   /*
+     Issue a ROLLBACK in case the last printed binlog was crashed and had half
+     of transaction.
