@@ -1,5 +1,7 @@
 同一目录下5.5.18_flashback.diff.txt为淘宝的patch文件
 
+与淘宝采用相同的参数-B来指定进行flashback的操作
+
 参考如下内容
 http://www.penglixun.com/tech/database/mysql_flashback_feature.html
 http://www.mysqlsupport.cn/mysqlbinlog-flashback/
