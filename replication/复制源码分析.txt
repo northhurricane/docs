@@ -1,0 +1,181 @@
+多线程复制源码分析
+version：5.6.12
+
+多线程复制分为两个重要部分。一个是从relay log中读取event并进行分配的线程，一个是重做event的线程。
+这两个过程都分成3个部分，标志事务开始的事件/事务开始后的事件的执行/标志事务结束的事件
+
+event的分配说明
+apply_event_and_update_pos：进行event的分配工作
+  Log_event::apply_event：
+    Log_event::get_slave_worker：选择合适的工作对象
+  append_item_to_jobs：发信号给Log_event::apply_event选择的工作对象，唤醒对应的工作线程
+
+event的重做说明
+  slave_worker_exec_job：进行event的重做工作
+    pop_jobs_item：该函数读取待重做的event
+	do_apply_event_worker：进行event的重做
+    part_event：是否携带partition信息的事件，begin/commit这些事件是没有partition信息的
+
+
+首先定义事件组，由begin事件，dml事件，xid组成的一个完整的事务，称为事件组，程序中使用group来表示
+
+基础说明：
+partition信息：为数据库的信息，如事件是在A数据库上发生，则partition信息就是数据库A的信息。
+mysql的动态数组保存的是数据内容的拷贝，如动态数组的元素大小（size）为128，传入待保存的数据在内存的指针，将会被拷贝128个字节到动态数组中
+关联关系：一个db只能对应一个worker，一个worker可以对应多个db；也就是一个db上事件只能在一个worker上进行串行重做，而一个worker可以串行重做多个db的事件
+
+rli（Relay_log_info）成员变量/函数说明
+成员变量
+1、gaq，每遇到begin事件，生成Slave_job_group数据，并加入到rli->gaq动态数组中，在后续携带db信息的事件指定给某个worker后，将该worker的id复制给给遇到begin事件后生成Slave_job_group数据，形成关联
+   gaq数组内容，在事件分配时和gaq->assigned_group_index配合使用，使所有事件组从属于相同的Slave_job_group；在worker进行事件重做时，与ev->mts_group_idx配合，worker能够找到每个事件恰当的事务信息
+   1-1、在事件组开始的时候，生成Slave_job_group数据，并加入到rli->gaq动态数组中
+   1-2、在事件组完成重做时（Slave_worker::slave_worker_ends_group），标志1-1种生成的Slave_job_group为done状态
+   1-3、在检查是否有新事件的时候，检查gaq中的Slave_job_group数据，发现有done的
+2、workers，记录每个复制线程所使用的worker的动态数组
+3、curr_group_da，对于begin事件，无法确定db的从属，curr_group_da保存begin的event记录，并在分派后续有db信息的event时（append_item_to_jobs），使用其db信息（相同entry)
+4、curr_group_seen_begin，碰到begin事件，设置为true，当rli->mts_group_status == Relay_log_info::MTS_END_GROUP时，设置为false；用于标识rli上事务的开始和截至
+5、mts_group_status，在碰到commit或者xid_log_event后设置为MTS_END_GROUP，在Log_event::apply_event中设置为Relay_log_info::MTS_IN_GROUP
+6、mts_groups_assigned，每开始一个事件组，该值都进行++操作，也就是碰到了100个事件组，该值就是100
+7、pending_jobs，待处理事件数目，在分配任务时（append_item_to_jobs)++，在进行事件处理时（slave_worker_exec_jobs）--。
+8、mts_pending_jobs_size，待处理事件字节大小，同pending_jobs的情况
+9、curr_group_assigned_parts，用于保存当前事件组的db-worker映射的entry
+10、event_relay_log_pos，记录relay log的event位置，在处理完一个事件后，指向下一个position；这个position是future_event_relay_log_pos。
+  在初始化上，有如下初始化的点，1、change master语句执行的时候，2、handle_slave_sql的，3、在重做event（exec_relay_log_event）时出现错误的时候，4、
+11、future_event_relay_log_pos，通过set_future_event_relay_log_pos函数进行更新，在每次读取事件（next_event）时进行设置my_b_tell(cur_log)。
+12、group_relay_log_pos，
+
+11、checkpoint_seqno，
+12、checkpoint_group，
+13、recovery_parallel_workers
+
+函数
+1、inc_event_relay_log_pos，用于更新relay log的位置
+2、inc_group_relay_log_pos，
+
+rli的gaq
+1、entry
+
+ev（Log_event）成员变量说明
+1、data_written，记录的是该event的在log中存储的字节长度（可通过mysqlbinlog查看事件的信息进行判断）
+2、mts_assigned_partitions，map_db_to_worker中建立db和worker的对应关系（entry），并将该该关系记录到本成员变量上；mts_number_dbs()配合，记录总的entry数目
+3、mts_group_idx，记录当前事件组使用rli的gaq动态数组的元素的下标
+4、mts_number_dbs，用于说明事件涉及的db数目，对于不同的事件是不同的处理。Query_log_event是根据内部的mts_accessed_dbs变量，除去Table_map_log_event和Execute_load_log_event，其他都是1
+5、mts_accessed_dbs（Query_log_event），
+6、future_event_relay_log_pos，物理上下一个event的位置，在读取下一个事件的时候进行设置（next_event）。
+
+worker(Slave_worker)成员变量的说明
+1、curr_group_exec_parts，用于保存当前事件组worker所涉及的db，
+  1-1、在worker线程，重做每个event的时候（slave_worker_exec_job），将该event的db-worker映射entry加入到worker中；
+  1-2、在worker结束事件组时（Slave_worker::slave_worker_ends_group），减少从属于worker的entry的usage数目，并清除动态数组中的记录。
+2、curr_group_seen_begin，在wokrer重做事件时，碰到事件组的begin事件，被设置为true；在worker结束事件组（slave_worker_ends_group）后，设置为false；用于标识事务是否开始
+3、end_group_sets_max_dbs，在wokrer重做事件时，碰到事件组的begin事件，被设置为true；begin后的事件处理时，用于判断后续事件是否携带database信息，如果携带了db信息，将被重新设置为false；在Log_event::contains_partition_info中使用，用于判断当前的事件是否携带db信息；用于标识事务是否刚刚开启（针对携带db信息的事件而言）
+4、usage_partition，和db_worker_hash_entry的usage有弱关联关系；
+   4-1、在map_db_to_worker中根据db找到对应的worker，如果是db首次和worker进行关联（entry==NULL或者entry->usage==0），则进行usage_partition++操作，以表示该worker有db在使用；
+   4-2、在事件组结束时（slave_worker_ends_group），清除worker上的db映射，如果entry的usage为0，则usage_partition--。
+
+ptr_g（Slave_job_group）成员变量说明
+1、checkpoint_log_name，事件在主机上的文件
+2、checkpoint_log_pos，事件在主机上的位置
+3、checkpoint_relay_log_name，事件在本地relay log的文件
+4、checkpoint_relay_log_pos，事件在本地relay log中的位置
+5、group_relay_log_name，事件在本地relay log中的位置
+
+entry（db_worker_hash_entry）成员变量说明
+entry用于记录db和worker的对应关系，一个db对应一个worker，一个worker可以对应多个db
+1、usage，记录event关联数据库的情况，表达的含义是在该db下有多少event要被处理，处理这些event的worker为worker字段所记录
+  1-1、当根据事件的数据库关联到worker时（map_db_to_worker）
+    1-1-1、如果在之前该数据库没有进行过关联，将分配新的entry，并entry的usage设置为1
+	1-1-2、如果该数据库已经关联到某个worker，则在entry上进行++操作
+	也就是说，每一个进行db和worker映射的事件，都会让entry的usage进行一次++操作，这个操作也会在slave thread中事件被处理完后进行逆向操作（--）
+  1-2、在事件组结束的时候（Slave_worker::slave_worker_ends_group），从worker的curr_group_exec_parts的动态数组中，取出该worker当前涉及的entry，并进行--操作
+  1-3、在等待worker完成任务（wait_for_workers_to_finish）时，需要等待事件全部完成，直到entry的usage的数目将为0，也就是无人使用entry
+
+
+全局变量/函数/宏定义说明
+函数
+1、map_db_to_worker
+  1-1、如果database在之前没有事件在其上发生并被处理，将会生成一个database名和worker对应的entry，并将这个entry加入到mapping_db_to_worker中；
+  1-2、如果database上有事件被处理过，则可以在mapping_db_to_worker中找到database对应的entry
+    1-2-1、如果entry的usage为0，也就是该entry没有任何事件要被处理，则选择一个当前任务做少的worker来进行当前的操作
+	1-2-2、否则说明某个worker正在处理该db上的事件，使用上次分配的worker
+2、trans_commit，提交事务
+3、mts_checkpoint_routine，
+
+全局变量
+1、mapping_db_to_worker
+  1-1、在将db和worker进行map时（map_db_to_worker），每产生一个新的db和worker映射的entry，就将这个entry加入到mapping_db_to_worker
+  1-2、每产生一个新的db和worker映射的entry，都会检查mapping_db_to_worker中的元素数目是否超过mts_partition_hash_soft_max，如果超过将对mapping_db_to_worker中usage为0的entry进行清除
+宏定义
+2、OVER_MAX_DBS_IN_EVENT_MTS，和Query_log_event的mts_accessed_dbs相关联
+3、MAX_DBS_IN_EVENT_MTS，
+
+
+程序运行说明
+1、对于ddl函数，没有begin事件和xid事件作为事务的开始和结束，如下代码中，worker->curr_group_seen_begin为false，part_event为true，is_gtid_event(ev)为false，进入事务结束处理
+  if (ev->ends_group() || (!worker->curr_group_seen_begin &&
+                           /*
+                              p-events of B/T-less {p,g} group (see
+                              legends of Log_event::get_slave_worker)
+                              obviously can't commit.
+                           */
+                           part_event && !is_gtid_event(ev)))
+2、rli->gaq的最多只能同时处理512个对象，当处理速度足够快，并发足够大的时候，会导致写入的覆盖，
+						   
+特殊表并行复制问题
+1、事件组的问题
+情况1、事件组只有指定表的dml操作
+情况2、事件组没有任何指定表的dml操作
+情况3、事件组中既有非指定表，又有指定表
+   A）先碰到指定表的dml操作
+   B）后碰到指定表的dml操作
+
+情况1、2，无法在开始情况下进行判断，所以，无法确定是否是单一情况
+情况3，碰到指定表的dml操作提取出来作为单独的执行内容
+
+2、并行复制表避免的操作
+情况1、不要使用db_worker_hash_entry记录数据库信息
+情况2、注意rli的
+
+为了便于快速进入代码，列出关键的调用堆栈，以显示线程入口
+event分配线程的堆栈
+#0  apply_event_and_update_pos (ptr_ev=0x7fffdf77c8a0, thd=0x7fffc4000a10,
+    rli=0x1d52b30)
+    at /home/jiangyx/mysql/ops/mysql/mysql-5-6-12-ctrip/sql/rpl_slave.cc:3297
+#1  0x0000000000a17ac6 in exec_relay_log_event (thd=0x7fffc4000a10,
+    rli=0x1d52b30)
+    at /home/jiangyx/mysql/ops/mysql/mysql-5-6-12-ctrip/sql/rpl_slave.cc:3742
+#2  0x0000000000a1c9e2 in handle_slave_sql (arg=0x18b0070)
+    at /home/jiangyx/mysql/ops/mysql/mysql-5-6-12-ctrip/sql/rpl_slave.cc:5552
+#3  0x0000000000aaa350 in pfs_spawn_thread (arg=0x1d6f870)
+    at /home/jiangyx/mysql/ops/mysql/mysql-5-6-12-ctrip/storage/perfschema/pfs.cc:1855
+#4  0x0000003b3c407851 in start_thread () from /lib64/libpthread.so.0
+#5  0x0000003b3bce890d in clone () from /lib64/libc.so.6
+
+
+event执行线程的堆栈
+#0  0x0000003b3c40b43c in pthread_cond_wait@@GLIBC_2.3.2 ()
+   from /lib64/libpthread.so.0
+#1  0x0000000000a30491 in inline_mysql_cond_wait (that=0x7fffc40210c0,
+    mutex=0x7fffc4021090,
+    src_file=0x1001d60 "/home/jiangyx/mysql/ops/mysql/mysql-5-6-12-ctrip/sql/rpl_rli_pdb.cc", src_line=2131)
+    at /home/jiangyx/mysql/ops/mysql/mysql-5-6-12-ctrip/include/mysql/psi/mysql_thread.h:1162
+#2  0x0000000000a35621 in pop_jobs_item (worker=0x7fffc401e3d0,
+    job_item=0x7fffdf73bd30)
+    at /home/jiangyx/mysql/ops/mysql/mysql-5-6-12-ctrip/sql/rpl_rli_pdb.cc:2131
+#3  0x0000000000a35794 in slave_worker_exec_job (worker=0x7fffc401e3d0,
+    rli=0x1d52b30)
+    at /home/jiangyx/mysql/ops/mysql/mysql-5-6-12-ctrip/sql/rpl_rli_pdb.cc:2171
+#4  0x0000000000a19a8f in handle_slave_worker (arg=0x7fffc401e3d0)
+    at /home/jiangyx/mysql/ops/mysql/mysql-5-6-12-ctrip/sql/rpl_slave.cc:4483
+#5  0x0000000000aaa350 in pfs_spawn_thread (arg=0x7fffc4022440)
+    at /home/jiangyx/mysql/ops/mysql/mysql-5-6-12-ctrip/storage/perfschema/pfs.cc:1855
+#6  0x0000003b3c407851 in start_thread () from /lib64/libpthread.so.0
+#7  0x0000003b3bce890d in clone () from /lib64/libc.so.6
+
+问题
+1、 rli->get_group_master_log_name()/rli->get_group_master_log_pos()
+2、Q：各个slave worker所指向的rli为同一个rli，在worker线程使用了哪些rli上的信息，如何确保不互相影响？
+3、Q：worker的set_future_event_relay_log_pos的作用是什么？
+4、Q：db_worker_hash_entry的usage变量的作用？
+5、Q：为什么用mysqlbinlog输出relay log中内容，end_log_pos为master上binlog的位置信息？
+
