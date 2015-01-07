@@ -89,21 +89,23 @@ rm -rf "$RPM_DIR"
 fi
 mkdir $RPM_DIR
 
-#test for branch checkout BRANCH=rpl_port
+#get source code
 cd $RPM_DIR
 git clone $REPOSITORY $SOURCE_DIR
 if (( $? )); then 
 exit 1 ; 
 fi
+#switch to branch if specified
 cd $SOURCE_DIR
+if [ "$BRANCH" != "master" ]; then
 git checkout -b $BRANCH origin/$BRANCH
+fi
 if (( $? )); then 
 exit 1 ; 
 fi
-#echo "git checkout -b $BRANCH origin/$BRANCH"
 cd ..
 
-#rpm directory
+#rpm building
 mkdir -p rpm/{BUILD,RPMS,SOURCES,SPECS,SRPMS} tmp
 tar -zcvf $SOURCE_TAR $SOURCE_DIR
 mkdir bld
