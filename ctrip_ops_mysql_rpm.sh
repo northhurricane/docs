@@ -114,4 +114,4 @@ cmake ../$SOURCE_DIR -DBUILD_CONFIG=mysql_release
 cd ..
 cp bld/support-files/*.spec rpm/SPECS
 cp $SOURCE_TAR rpm/SOURCES
-rpmbuild -v --define="_topdir $PWD/rpm" --define="_tmppath $PWD/tmp" -ba rpm/SPECS/$SPEC
+rpmbuild -v --define="_topdir $PWD/rpm" --define="distro_specific 1" --define="_tmppath $PWD/tmp" -ba rpm/SPECS/$SPEC
