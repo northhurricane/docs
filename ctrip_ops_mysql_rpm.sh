@@ -11,10 +11,11 @@ SOURCE_DIR_DEFAULT="mysql-5.6.21"
 BRANCH_DEFAULT="master"
 SOURCE_TAR_DEFAULT="mysql-5.6.21.tar.gz"
 SPEC_DEFAULT="mysql.5.6.21.spec"
+RPM_BASE_DIR_DEFAULT="~"
 
 MYSQL_VERSION=$MYSQL_VERSION_DEFAULT
 
-while getopts "v:b:" arg #选项后面的冒号表示该选项需要参数
+while getopts "v:b:d:" arg #选项后面的冒号表示该选项需要参数
 do
   case $arg in
   v)
@@ -25,6 +26,9 @@ do
 #    echo "b"
     BRANCH="$OPTARG"
 echo "$BRANCH"
+    ;;
+  d)
+    RPM_BASE_DIR="$OPTARG"
     ;;
   ?)  #当有不认识的选项的时候arg为?
     echo "unkonw argument"
@@ -72,15 +76,26 @@ BRANCH=$BRANCH_DEFAULT
 fi
 #echo "$BRANCH"
 
+#debug for show current infomation 
+#read
+
+#get rpm build base dir
+if [ -z "$RPM_BASE_DIR" ]
+then
+RPM_BASE_DIR=$RPM_BASE_DIR_DEFAULT
+#echo "RPM_BASE_DIR -z"
+fi
+#echo "RPM_BASE_DIR is $RPM_BASE_DIR"
+
 echo "Building Mysql rpm at version "$MYSQL_VERSION
 echo "Code repository is "$REPOSITORY
 echo "Features are from branch "$BRANCH
 echo "Code directory is "$SOURCE_DIR
+echo "rpm building directory is "$RPM_BASE_DIR
 
-#debug for show current infomation 
-#read
+cd "$RPM_BASE_DIR"
 
-cd ~
+#exit
 
 if [ -d "$RPM_DIR" ];
 then
