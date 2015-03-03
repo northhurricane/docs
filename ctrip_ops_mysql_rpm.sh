@@ -1,6 +1,6 @@
 #!/bin/bash
 #possible pre-request 
-#sudo yum install rpm-build redhat-rpm-config gcc gcc-c++ cmake make zlib-devel openssl-devel gperf
+#sudo yum install rpm-build redhat-rpm-config gcc gcc-c++ cmake make zlib-devel openssl-devel gperf ncurses-devel bison git
 
 #variables of version / branch.
 
