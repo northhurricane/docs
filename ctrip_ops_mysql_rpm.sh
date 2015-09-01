@@ -1,14 +1,16 @@
 #!/bin/bash
 #possible pre-request 
-#sudo yum install rpm-build redhat-rpm-config gcc gcc-c++ cmake make zlib-devel openssl-devel gperf ncurses-devel bison git
+#sudo yum install rpm-build redhat-rpm-config gcc gcc-c++ cmake make zlib-devel openssl-devel gperf ncurses-devel bison git libaio-devel
 
 #variables of version / branch.
 
 #default version is 5.6.21. relative variables' default value list below
 MYSQL_VERSION_DEFAULT="5.6.21"
-REPOSITORY_DEFAULT="http://git.dev.sh.ctripcorp.com/ops-mysql/mysql-5-6-21-ctrip.git"
+#REPOSITORY_DEFAULT="http://git.dev.sh.ctripcorp.com/ops-mysql/mysql-5-6-21-ctrip.git"
+REPOSITORY_DEFAULT="git@git.dev.sh.ctripcorp.com:ops-mysql/mysql-5-6-21-ctrip.git"
 SOURCE_DIR_DEFAULT="mysql-5.6.21"
-BRANCH_DEFAULT="master"
+#BRANCH_DEFAULT="master"
+BRANCH_DEFAULT="feature_audit_dev_jiangyx"
 SOURCE_TAR_DEFAULT="mysql-5.6.21.tar.gz"
 SPEC_DEFAULT="mysql.5.6.21.spec"
 RPM_BASE_DIR_DEFAULT="~"
