@@ -1,0 +1,61 @@
+build mysql connector j from source
+
+如何通过源码编译mysql，获得mysql的java connector，从而可以通过该方法加入自己的调试信息调试mysql的java客户端，或者增加一些必要的功能
+
+环境
+操作系统：centos6.4 64位机器
+connector：5.1.35
+
+1、编译准备
+1、1安装jdk5和jdk6
+
+针对jdbc3和jdbc4，需要的环境是不同的，只有jdk6是无法完成编译的
+
+在安装jdk5时，由于是32位的，所以必须安装32位软件的支持库。可通过如下命令来安装
+sudo yum install glibc.i686
+参考：
+http://stackoverflow.com/questions/8328250/centos-64-bit-bad-elf-interpreter
+http://knowledgebase.progress.com/articles/Article/000049566
+
+1、2hibernate组件
+编译时需要hibernate的组件，通过 http://sourceforge.net/projects/hibernate/files/hibernate4/下载hibernate组件
+注意：connector 5.1.35只支持4.1.*和4.2.*，不支持4.3.*
+
+1、3安装Ant Contrib/JUnit
+yum install ant-contrib.noarch
+
+2、编译
+2、1获取源码，后面用{源码目录}表示源码所在目录
+源码目录如下结构
+build
+build.properties
+build.xml
+CHANGES
+COPYING
+dist
+docs
+mysql-connector-java-5.1.35-bin.jar
+README
+README.txt
+src
+
+2、2将hibernate的"lib/require/"目录下的内容拷贝到"{源码目录}/src/lib/hibernate4"目录下
+
+2、3将junit.jar拷贝到"{源码目录}/src/lib"目录下
+
+2、4创建build.properties文件
+指定jdk5/6的路径，内容类似如下
+com.mysql.jdbc.jdk5=/usr/java/jdk1.5.0_22
+com.mysql.jdbc.jdk6=/sbin/java/jdk1.7.0_60
+
+2、5修改build.xml（非必要）
+如果安装的jdk7而不是jdk6，则需要修改文件中检查版本号的内容
+
+2、6进行编译
+ant
+
+参考：
+https://blogs.oracle.com/mysqlconnectors-java/entry/building_mysql_connector_j_5
+http://dev.mysql.com/doc/connector-j/en/connector-j-installing-source.html
+http://downloads.mysql.com/docs/connector-j-en.a4.pdf
+http://forums.mysql.com/read.php?39,612977,612977
