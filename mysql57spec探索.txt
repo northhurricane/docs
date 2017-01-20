@@ -1,0 +1,20 @@
+mysql rpm spec文件修改记录
+
+第一rpm打包
+1、注释掉%clean部分的代码，生成rpm文件后后不会删除文件已有的文件
+
+利用已有的结果，只进行rpm包的打包
+1、注释掉%prep的%setup，该部分会重新展开tar包，导致之前的编译内容变化（该方法存在隐患，参看3的修正）
+http://rpm.org/max-rpm-snapshot/s1-rpm-inside-macros.html
+
+2、注释掉%build下的cmake等命令，防止重复编译
+
+3、不知什么原因，注释%prep的内容后，在%build和%install中无法进入mysql-5.7.17目录，所以出现目录中文件不存在的错误。
+解决方法是修改%prep，保存之前的编译结果，在重新生成数据后，将之前的数据恢复，代码如下
+%prep
+cd $RPM_BUILD_DIR
+mv mysql-5.7.17 mysql-5.7.17-bak
+%setup -T -a 0 -c -n %{src_dir}
+cd $RPM_BUILD_DIR
+rm -rf mysql-5.7.17
+mv mysql-5.7.17-bak mysql-5.7.17
